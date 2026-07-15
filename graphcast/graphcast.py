@@ -124,9 +124,14 @@ class GraphCastModel(nn.Module):
         x = x.view(1, -1, x.shape[-1])
         x = (x - self.norm_b) / self.norm_k
 
-        g2m_gf_out, g2m_mf_out = checkpoint(self.grid2mesh, x, use_reentrant=False)
-        m2m_mf_out = checkpoint(self.mesh2mesh, g2m_mf_out, use_reentrant=False)
-        dynamic_delta = checkpoint(self.mesh2grid, m2m_mf_out, g2m_gf_out, use_reentrant=False)
+        if self.training:
+            g2m_gf_out, g2m_mf_out = checkpoint(self.grid2mesh, x, use_reentrant=False)
+            m2m_mf_out = checkpoint(self.mesh2mesh, g2m_mf_out, use_reentrant=False)
+            dynamic_delta = checkpoint(self.mesh2grid, m2m_mf_out, g2m_gf_out, use_reentrant=False)
+        else:
+            g2m_gf_out, g2m_mf_out = self.grid2mesh(x)
+            m2m_mf_out = self.mesh2mesh(g2m_mf_out)
+            dynamic_delta = self.mesh2grid(m2m_mf_out, g2m_gf_out)
 
         dynamic_delta = dynamic_delta.view(dynamic1.shape) * self.k_diff_dynamic
         if target is None: return dynamic2 + dynamic_delta

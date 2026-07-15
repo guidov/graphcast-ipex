@@ -1,3 +1,9 @@
+import os
+# Fix OpenCL ICD override bug in Conda environment
+for var in ['OCL_ICD_VENDORS', 'OCL_ICD_VENDORS_RESET', 'OCL_ICD_FILENAMES_RESET']:
+    if var in os.environ:
+        del os.environ[var]
+
 import numpy as np
 import json, pickle
 from time import time
@@ -39,7 +45,13 @@ force_t1 = forcefield.force_5cn(t0, data_config['lats'], data_config['lons'])
 force_t2 = forcefield.force_5cn(t1, data_config['lats'], data_config['lons'])
 
 # 5. 初始化模型与加载权重
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+if torch.cuda.is_available():
+    device = torch.device('cuda')
+elif torch.xpu.is_available():
+    device = torch.device('xpu')
+else:
+    device = torch.device('cpu')
+print(f"Using device: {device}")
 
 net = graphcast.GraphCastModel(graph_body, norm_vector)
 net.load_state_dict(torch.load(model_root + '/GraphWeight.pth'))
