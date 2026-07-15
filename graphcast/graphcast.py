@@ -85,17 +85,53 @@ class GraphCastModel(nn.Module):
         # 3. 加载权重
         # load_weights(self, weights_dict)
 
+    def _empty_cache(self):
+        device = next(self.parameters()).device
+        if device.type == 'xpu':
+            torch.xpu.empty_cache()
+        elif device.type == 'cuda':
+            torch.cuda.empty_cache()
+
     def grid2mesh(self, x):
         latent_grid = self.g2m_enc_grid(torch.cat([x, self.g2m_gf], dim=-1))
-        
-        # 模拟 dummy mesh
-        # torch.zeros((x.shape[0], self.g2m_mf.shape[1], x.shape[-1]), device=x.device)
         latent_mesh = self.g2m_enc_mesh(torch.cat([x[:, :self.nmesh] * 0, self.g2m_mf], dim=-1))
         
-        latent_edge = self.g2m_enc_edge(self.g2m_ef)
-        _, node_delta = self.g2m_int(latent_grid, latent_mesh, latent_edge, self.g2m_idx)
+        # Memory-efficient chunking to avoid OOM on GPUs with <= 12GB VRAM
+        chunk_size = 32768
+        g2m_edges = self.g2m_ef.shape[1]
+        senders, receivers = self.g2m_idx[:, 0], self.g2m_idx[:, 1]
+        agg_msg = torch.zeros_like(latent_mesh)
+        
+        for i in range(0, g2m_edges, chunk_size):
+            s_idx = senders[i:i+chunk_size]
+            r_idx = receivers[i:i+chunk_size]
+            
+            # Encode edges chunk
+            ef_chunk = self.g2m_ef[:, i:i+chunk_size, :]
+            latent_edge_chunk = self.g2m_enc_edge(ef_chunk)
+            
+            # Gather nodes chunk
+            s_nodes_chunk = latent_grid[:, s_idx, :]
+            r_nodes_chunk = latent_mesh[:, r_idx, :]
+            
+            # Concatenate and run Edge MLP
+            edge_in = torch.cat([latent_edge_chunk, s_nodes_chunk, r_nodes_chunk], dim=-1)
+            edge_delta = self.g2m_int.edge_mlp(edge_in)
+            
+            # Scatter add message
+            r_idx_view = r_idx.view(1, -1, 1).expand(edge_delta.size(0), -1, edge_delta.size(2))
+            agg_msg.scatter_add_(1, r_idx_view, edge_delta)
+            
+            # Clean up loop variables to release VRAM immediately
+            del ef_chunk, latent_edge_chunk, s_nodes_chunk, r_nodes_chunk, edge_in, edge_delta, r_idx_view
+            self._empty_cache()
+            
+        # Node MLP
+        node_in = torch.cat([latent_mesh, agg_msg], dim=-1)
+        node_delta = self.g2m_int.node_mlp(node_in)
         
         grid_out = latent_grid + self.g2m_grid_self(latent_grid)
+        self._empty_cache()
         return grid_out, latent_mesh + node_delta
 
     def mesh2mesh(self, m2m_node_in):
@@ -107,12 +143,46 @@ class GraphCastModel(nn.Module):
             e_delta, n_delta = processor(cur_node, cur_node, cur_edge, self.m2m_idx)
             cur_edge = cur_edge + e_delta
             cur_node = cur_node + n_delta
+        self._empty_cache()
         return cur_node
 
     def mesh2grid(self, mesh_node, grid_node):
-        latent_edge = self.m2g_enc_edge(self.m2g_ef)
-        _, n_delta = self.m2g_int(mesh_node, grid_node, latent_edge, self.m2g_idx)
-        final_grid = grid_node + n_delta
+        # Memory-efficient chunking to avoid OOM on GPUs with <= 12GB VRAM
+        chunk_size = 32768
+        m2g_edges = self.m2g_ef.shape[1]
+        senders, receivers = self.m2g_idx[:, 0], self.m2g_idx[:, 1]
+        agg_msg = torch.zeros_like(grid_node)
+        
+        for i in range(0, m2g_edges, chunk_size):
+            s_idx = senders[i:i+chunk_size]
+            r_idx = receivers[i:i+chunk_size]
+            
+            # Encode edges chunk
+            ef_chunk = self.m2g_ef[:, i:i+chunk_size, :]
+            latent_edge_chunk = self.m2g_enc_edge(ef_chunk)
+            
+            # Gather nodes chunk
+            s_nodes_chunk = mesh_node[:, s_idx, :]
+            r_nodes_chunk = grid_node[:, r_idx, :]
+            
+            # Concatenate and run Edge MLP
+            edge_in = torch.cat([latent_edge_chunk, s_nodes_chunk, r_nodes_chunk], dim=-1)
+            edge_delta = self.m2g_int.edge_mlp(edge_in)
+            
+            # Scatter add message
+            r_idx_view = r_idx.view(1, -1, 1).expand(edge_delta.size(0), -1, edge_delta.size(2))
+            agg_msg.scatter_add_(1, r_idx_view, edge_delta)
+            
+            # Clean up loop variables to release VRAM immediately
+            del ef_chunk, latent_edge_chunk, s_nodes_chunk, r_nodes_chunk, edge_in, edge_delta, r_idx_view
+            self._empty_cache()
+            
+        # Node MLP
+        node_in = torch.cat([grid_node, agg_msg], dim=-1)
+        node_delta = self.m2g_int.node_mlp(node_in)
+        
+        final_grid = grid_node + node_delta
+        self._empty_cache()
         return self.head(final_grid)
 
     def forward(self, const, dynamic1, dynamic2, force1, force2, force3, target=None):
