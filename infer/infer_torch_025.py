@@ -58,6 +58,19 @@ net.load_state_dict(torch.load(model_root + '/GraphWeight.pth'))
 net.to(device=device, dtype=torch.bfloat16)
 net.eval()
 
+# Initialize predictions file
+pred_nc_path = 'predictions_025.nc'
+dynamic_vars_def = {k: v for k, v in data_config['dynamic_vars'].items()}
+ncutil.init_nc(pred_nc_path, dynamic_vars=dynamic_vars_def, 
+               lats=data_config['lats'], lons=data_config['lons'], levels=levels)
+
+# Write initial states (t0 and t1)
+lat_len, lon_len = int(data_config['lats'][2]), int(data_config['lons'][2])
+for t_val, dyn_val in [(t0, dynamic_t1), (t1, dynamic_t2)]:
+    pred_dict = ncutil.unstack(dyn_val[None, :], data_config['dynamic_vars'])
+    pred_dict_reshaped = {k: v[0].reshape(lat_len, lon_len, v.shape[-1]) for k, v in pred_dict.items()}
+    ncutil.write_nc(pred_nc_path, pred_dict_reshaped, t_val)
+
 # 6. 自回归推理循环
 print("Starting inference...")
 start = time()
@@ -70,6 +83,11 @@ for step, t in enumerate(ts):
         dynamic_next = net.forward(*tensor_input)
         force_t1, force_t2 = force_t2, force_next
         dynamic_t1, dynamic_t2 = dynamic_t2, dynamic_next.to(torch.float32).cpu().numpy()
+        
+        # Write step prediction
+        pred_dict = ncutil.unstack(dynamic_t2[None, :], data_config['dynamic_vars'])
+        pred_dict_reshaped = {k: v[0].reshape(lat_len, lon_len, v.shape[-1]) for k, v in pred_dict.items()}
+        ncutil.write_nc(pred_nc_path, pred_dict_reshaped, t)
         
         # Free GPU memory immediately
         del tensor_input, x_input, dynamic_next
