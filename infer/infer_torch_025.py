@@ -31,7 +31,7 @@ levels = data_config['levels']
 # 3. 时间步解析
 ds_data = ncutil.nc.Dataset('../weights/testdata_and_normvector/source-era5_date-2022-01-01_res-0.25_levels-37_steps-01.nc')
 t0, t1 = ncutil.get_times(ds_data)[:2]
-ts = t1 + (np.arange(4) + 1) * (t1 - t0) # next 4 step
+ts = t1 + (np.arange(40) + 1) * (t1 - t0) # next 4 step
 
 # 4. 纯净的数据提取
 print("Loading data...")
